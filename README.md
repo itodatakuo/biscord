@@ -11,3 +11,5 @@ npm run dev
 cd ./backend
 cargo run --release
 ```
+
+localhost:3000
