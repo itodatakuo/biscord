@@ -1,8 +1,8 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
         Path,
+        State,
     },
     response::IntoResponse,
     routing::get,
@@ -32,7 +32,7 @@ async fn main() {
 
     // ルーティング: /ws/:room_id
     let app = Router::new()
-        .route("/ws/:room_id", get(ws_handler))
+        .route("/ws/{room_id}", get(ws_handler))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 5000));
@@ -91,7 +91,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, room_id: String)
     // 送信用タスク: ルームの broadcast から受け取って、このクライアントに送信
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg)).await.is_err() {
+            // msg: String -> Utf8Bytes
+            if sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
@@ -101,7 +102,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, room_id: String)
     while let Some(msg_result) = receiver.next().await {
         match msg_result {
             Ok(Message::Text(text)) => {
-                // 同じ room_id に居るクライアントにしか届かない
+                // text: Utf8Bytes -> String に変換
+                let text = text.to_string();
                 let _ = room_sender.send(text);
             }
             Ok(Message::Close(_)) => {
