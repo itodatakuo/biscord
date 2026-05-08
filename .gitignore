@@ -1,0 +1,11 @@
+# Rust
+/target
+Cargo.lock
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Env
+.env
+``
