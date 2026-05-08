@@ -5,7 +5,7 @@ use axum::{
         State,
     },
     response::IntoResponse,
-    routing::get,
+    routing::{get,post},
     Router,
 };
 
@@ -13,6 +13,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock};
 
+use sqlx::PgPool;
+use bcrypt::{hash, verify, DEFAULT_COST};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,18 +23,62 @@ use std::sync::Arc;
 struct AppState {
     // ルーム名 -> そのルーム用の broadcast::Sender
     rooms: RwLock<HashMap<String, broadcast::Sender<String>>>,
+
+    sessions: RwLock<HashMap<String,String>>,
+
+    db: PgPool,
+}
+//リクエスト/レスポンス
+use serde::{Deserialize,Serialize};
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse{
+    token:String,
+}
+
+use axum::{Json,http::StatusCode};
+use uuid::Uuid;
+
+use axum::extract::Query;
+
+#[derive(Deserialize)]
+struct WsQuery {
+    token:String,
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username: String,
+    password: String,
 }
 
 #[tokio::main]
 async fn main() {
     // 最初はルームは空
+
+    let db = PgPool::connect(
+        "postgres://postgres:takuo2525@localhost:5432/chat"
+    ) 
+    .await
+    .unwrap();
+
     let app_state = Arc::new(AppState {
         rooms: RwLock::new(HashMap::new()),
+        sessions:RwLock::new(HashMap::new()),
+        db,
     });
 
     // ルーティング: /ws/:room_id
     let app = Router::new()
         .route("/ws/{room_id}", get(ws_handler))
+        .route("/login",post(login_handler))
+        .route("/register", post(register_handler))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 5000));
@@ -69,17 +115,89 @@ async fn get_or_create_room_sender(
     tx
 }
 
-// WebSocketハンドラ: /ws/:room_id
+//wsハンドラ
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Path(room_id): Path<String>,        // URL から room_id を取得
-    State(state): State<Arc<AppState>>, // アプリ状態
+    Path(room_id): Path<String>,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, room_id))
+    let username = {
+        let sessions = state.sessions.read().await;
+        sessions.get(&query.token).cloned()
+    };
+
+    if let Some(username) = username {
+        let state = Arc::clone(&state);
+        ws.on_upgrade(move |socket| {
+            handle_socket(socket, state, room_id, username)
+        })
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+//ログインハンドラ
+use sqlx::Row;
+
+async fn login_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    let record = sqlx::query(
+        "SELECT password_hash FROM users WHERE username = $1"
+    )
+    .bind(&req.username)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let Some(row) = record else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let password_hash: String = row
+        .try_get("password_hash")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !verify(&req.password, &password_hash).unwrap() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let token = Uuid::new_v4().to_string();
+
+    state.sessions.write().await.insert(token.clone(), req.username);
+
+    Ok(Json(LoginResponse { token }))
+}
+
+// レジスタハンドラ
+async fn register_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let password_hash = hash(&req.password,DEFAULT_COST)
+    .map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let result = sqlx::query(
+    "INSERT INTO users (username, password_hash) VALUES ($1, $2)"
+)
+.bind(&req.username)
+.bind(&password_hash)
+.execute(&state.db)
+.await;
+        match result {
+            Ok(_) => Ok(StatusCode::CREATED),
+            Err(_) => Err(StatusCode::CONFLICT),// username重複
+        }
 }
 
 // 実際の通信処理
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>, room_id: String) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    room_id: String,
+    username: String,) {
     // この接続が参加するルームの sender を取得
     let room_sender = get_or_create_room_sender(&state, &room_id).await;
 
@@ -92,31 +210,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, room_id: String)
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             // msg: String -> Utf8Bytes
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+            let _ = sender.send(Message::Text(msg.into())).await;
             }
-        }
     });
-
     // 受信用ループ: クライアントからのメッセージをこのルームに broadcast
-    while let Some(msg_result) = receiver.next().await {
-        match msg_result {
-            Ok(Message::Text(text)) => {
-                // text: Utf8Bytes -> String に変換
-                let text = text.to_string();
-                let _ = room_sender.send(text);
-            }
-            Ok(Message::Close(_)) => {
-                break;
-            }
-            Ok(_) => {
-                // Binary や Ping などは今は無視
-            }
-            Err(_) => {
-                break;
-            }
-        }
+    while let Some(Ok(Message::Text(text))) = receiver.next().await {
+        let msg = format!("{}: {}",username,text);
+        let _ = room_sender.send(msg);
     }
-
     send_task.abort();
+
+    
 }
