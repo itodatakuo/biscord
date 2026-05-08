@@ -115,7 +115,7 @@ async fn get_or_create_room_sender(
     tx
 }
 
-//wsハンドラ
+//wsハンドラ: /ws/:room_id
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(room_id): Path<String>,
